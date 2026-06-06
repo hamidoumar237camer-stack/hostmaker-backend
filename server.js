@@ -4,7 +4,6 @@ const fs = require('fs');
 const path = require('path');
 const archiver = require('archiver');
 const { v4: uuidv4 } = require('uuid');
-const FormData = require('form-data');
 const fetch = require('node-fetch');
 const cors = require('cors');
 const AdmZip = require('adm-zip');
@@ -12,40 +11,38 @@ const AdmZip = require('adm-zip');
 const app = express();
 const upload = multer({ dest: 'uploads/' });
 
-const NETLIFY_TOKEN = process.env.NETLIFY_TOKEN;
+const VERCEL_TOKEN = process.env.VERCEL_TOKEN;
 
 app.use(cors());
 app.use(express.json());
 
-// Test du token au démarrage
-async function testNetlifyToken() {
-    console.log('🔍 Test du token Netlify...');
-    console.log('Token présent :', NETLIFY_TOKEN ? 'OUI' : 'NON');
+// Test du token Vercel
+async function testVercelToken() {
+    console.log('🔍 Test du token Vercel...');
+    console.log('Token présent :', VERCEL_TOKEN ? 'OUI' : 'NON');
     
-    if (!NETLIFY_TOKEN) {
-        console.log('❌ ERREUR : Token Netlify manquant !');
+    if (!VERCEL_TOKEN) {
+        console.log('❌ ERREUR : Token Vercel manquant !');
         return;
     }
     
     try {
-        const response = await fetch('https://api.netlify.com/api/v1/sites', {
-            headers: { 'Authorization': `Bearer ${NETLIFY_TOKEN}` }
+        const response = await fetch('https://api.vercel.com/v1/projects', {
+            headers: { 'Authorization': `Bearer ${VERCEL_TOKEN}` }
         });
         
-        console.log('📡 Réponse API Netlify :', response.status);
+        console.log('📡 Réponse API Vercel :', response.status);
         
         if (response.status === 200) {
-            const data = await response.json();
-            console.log('✅ Token Netlify VALIDE');
-            console.log(`📊 ${data.length} site(s) trouvé(s)`);
+            console.log('✅ Token Vercel VALIDE');
         } else {
-            console.log('❌ Token Netlify INVALIDE');
+            console.log('❌ Token Vercel INVALIDE');
         }
     } catch (error) {
         console.log('❌ Erreur :', error.message);
     }
 }
-testNetlifyToken();
+testVercelToken();
 
 // Fonction pour extraire les fichiers d'un ZIP
 async function extractZip(zipPath, outputDir) {
@@ -67,6 +64,29 @@ async function extractZip(zipPath, outputDir) {
     }
 }
 
+// Fonction pour encoder les fichiers en base64 pour Vercel
+async function encodeFilesToBase64(dirPath, basePath = '') {
+    const files = fs.readdirSync(dirPath);
+    const fileList = [];
+    
+    for (const file of files) {
+        const fullPath = path.join(dirPath, file);
+        const relativePath = basePath ? `${basePath}/${file}` : file;
+        
+        if (fs.statSync(fullPath).isDirectory()) {
+            const subFiles = await encodeFilesToBase64(fullPath, relativePath);
+            fileList.push(...subFiles);
+        } else {
+            const content = fs.readFileSync(fullPath);
+            fileList.push({
+                file: relativePath,
+                data: content.toString('base64')
+            });
+        }
+    }
+    return fileList;
+}
+
 // Endpoint de déploiement
 app.post('/deploy', upload.array('files'), async (req, res) => {
     console.log('\n🚀 Nouvelle demande de déploiement');
@@ -86,10 +106,8 @@ app.post('/deploy', upload.array('files'), async (req, res) => {
             console.log('📦 Fichier ZIP détecté, extraction en cours...');
             const zipPath = files[0].path;
             await extractZip(zipPath, tempDir);
-            // Supprimer le ZIP original après extraction
             fs.unlinkSync(zipPath);
         } else {
-            // Fichiers individuels
             for (const file of files) {
                 const originalPath = file.originalname;
                 const targetPath = path.join(tempDir, originalPath);
@@ -121,42 +139,44 @@ app.post('/deploy', upload.array('files'), async (req, res) => {
             throw new Error('Aucun fichier index.html trouvé dans le dossier ou ZIP');
         }
         
-        // Créer le ZIP final pour Netlify
-        const zipPath = `${tempDir}.zip`;
-        const output = fs.createWriteStream(zipPath);
-        const archive = archiver('zip', { zlib: { level: 9 } });
+        // Encoder les fichiers pour Vercel
+        const encodedFiles = await encodeFilesToBase64(tempDir);
         
-        await new Promise((resolve, reject) => {
-            output.on('close', resolve);
-            archive.on('error', reject);
-            archive.pipe(output);
-            archive.directory(tempDir, false);
-            archive.finalize();
-        });
+        // Créer un nom unique pour le déploiement
+        const deploymentName = `hostmaker-${Date.now()}`;
         
-        // Envoyer à Netlify
-        const formData = new FormData();
-        formData.append('file', fs.createReadStream(zipPath), 'site.zip');
+        console.log('📤 Envoi à Vercel...');
         
-        const response = await fetch('https://api.netlify.com/api/v1/sites', {
+        // API Vercel pour créer un déploiement
+        const response = await fetch('https://api.vercel.com/v13/deployments', {
             method: 'POST',
             headers: {
-                'Authorization': `Bearer ${NETLIFY_TOKEN}`
+                'Authorization': `Bearer ${VERCEL_TOKEN}`,
+                'Content-Type': 'application/json'
             },
-            body: formData
+            body: JSON.stringify({
+                name: deploymentName,
+                files: encodedFiles,
+                projectSettings: {
+                    framework: null,
+                    buildCommand: null,
+                    outputDirectory: '/',
+                    installCommand: null
+                }
+            })
         });
         
         const data = await response.json();
         
         if (!response.ok) {
-            throw new Error(`Netlify error: ${response.status} - ${JSON.stringify(data)}`);
+            throw new Error(`Vercel error: ${response.status} - ${JSON.stringify(data)}`);
         }
         
-        const siteUrl = data.ssl_url || data.url || `https://${data.default_domain}`;
+        // L'URL du site déployé
+        const siteUrl = `https://${data.url}`;
         
         // Nettoyer
         fs.rmSync(tempDir, { recursive: true, force: true });
-        fs.unlinkSync(zipPath);
         
         console.log(`✅ Site déployé : ${siteUrl}`);
         res.json({ success: true, url: siteUrl });
@@ -168,10 +188,11 @@ app.post('/deploy', upload.array('files'), async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    res.json({ message: 'HostMaker API fonctionne' });
+    res.json({ message: 'HostMaker API fonctionne avec Vercel !' });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`\n🚀 Serveur démarré sur le port ${PORT}`);
+    console.log('🌐 API prête pour Vercel');
 });
